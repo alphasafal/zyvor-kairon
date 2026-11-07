@@ -208,6 +208,64 @@ func TestCleanupProceedsWhenNoMigrationInFlight(t *testing.T) {
 	}
 }
 
+func TestCleanupDeletesVMFoundByNameWhenRuntimeIDMissing(t *testing.T) {
+	now := time.Now().UTC()
+	machine := model.Machine{
+		Metadata: model.ObjectMeta{Name: "db", Namespace: "prod", Finalizers: []string{model.Finalizer}, DeletionTimestamp: &now},
+		Spec:     model.MachineSpec{NodeName: "worker-1", Image: model.ImageSpec{Path: "/images/db.qcow2"}, Resources: model.ResourceSpec{CPU: "2", Memory: "2Gi"}, PowerState: "Running"},
+		// No RuntimeID: the VM was created but its status patch never landed.
+	}
+	var deleteCalled, deleteBeforeFinalizer, finalizerCleared bool
+	ks := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/apis/kairon.zyvor.dev/v1/machines":
+			_ = json.NewEncoder(w).Encode(model.MachineList{Items: []model.Machine{machine}})
+		case r.Method == http.MethodGet && r.URL.Path == "/apis/kairon.zyvor.dev/v1/namespaces/prod/machinemigrations":
+			_ = json.NewEncoder(w).Encode(model.MachineMigrationList{})
+		case r.Method == http.MethodPatch && r.URL.Path == "/apis/kairon.zyvor.dev/v1/namespaces/prod/machines/db":
+			var p struct {
+				Metadata model.ObjectMeta `json:"metadata"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&p)
+			if len(p.Metadata.Finalizers) == 0 {
+				finalizerCleared = true
+				deleteBeforeFinalizer = deleteCalled
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.Error(w, "unexpected", http.StatusNotFound)
+		}
+	}))
+	defer ks.Close()
+	fs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/vms" && r.URL.Query().Get("name") == "kairon-prod-db":
+			_, _ = io.WriteString(w, `[{"id":"vm-123","name":"kairon-prod-db","status":"running"}]`)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/vms/vm-123":
+			deleteCalled = true
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.Error(w, "unexpected", http.StatusNotFound)
+		}
+	}))
+	defer fs.Close()
+
+	kc, _ := kube.New(ks.URL, "", "", false)
+	kc.HTTP = ks.Client()
+	fc := fluxvm.New(fs.URL, "")
+	fc.HTTP = fs.Client()
+	a := &Agent{NodeName: "worker-1", Kube: kc, Flux: fc, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	if err := a.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !deleteCalled {
+		t.Fatal("expected cleanup to find the VM by name and delete it when status.runtimeID is empty")
+	}
+	if !finalizerCleared || !deleteBeforeFinalizer {
+		t.Fatal("expected the finalizer to be removed only after the VM was deleted")
+	}
+}
+
 func TestImageRootRejectsTraversal(t *testing.T) {
 	machine := model.Machine{
 		Metadata: model.ObjectMeta{Name: "bad", Namespace: "prod", Finalizers: []string{model.Finalizer}},

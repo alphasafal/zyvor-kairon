@@ -1000,8 +1000,22 @@ func (a *Agent) mayRestartFailedRuntime(ctx context.Context, m model.Machine) (b
 }
 
 func (a *Agent) cleanup(ctx context.Context, m model.Machine) error {
-	if m.Status.RuntimeID != "" {
-		if err := a.Flux.Delete(ctx, m.Status.RuntimeID); err != nil {
+	runtimeID := m.Status.RuntimeID
+	if runtimeID == "" {
+		// The VM can exist before status.runtimeID records it: the status
+		// patch after create failed, or the Machine was deleted before the
+		// next tick. Find it by name, as current() does, so deleting the
+		// Machine never leaves its VM running untracked.
+		rec, err := a.Flux.LookupByName(ctx, m.RuntimeName())
+		if err != nil {
+			return err
+		}
+		if rec != nil {
+			runtimeID = rec.ID()
+		}
+	}
+	if runtimeID != "" {
+		if err := a.Flux.Delete(ctx, runtimeID); err != nil {
 			return err
 		}
 	}
